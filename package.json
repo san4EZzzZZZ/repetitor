@@ -1,0 +1,13 @@
+{
+  "name": "tutor-booking",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Личный кабинет репетитора и запись учеников на занятия",
+  "scripts": { "start": "node server.js" },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "lowdb": "^7.0.1"
+  }
+}
