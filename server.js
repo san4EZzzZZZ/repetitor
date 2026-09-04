@@ -53,13 +53,16 @@ app.get('/api/me', auth, async (req, res) => { await db.read(); res.json({ user:
 app.get('/api/student', auth, async (req, res) => {
   await db.read(); const courses = db.data.courses.filter(c => db.data.assignments.some(a => a.courseId === c.id && a.studentId === req.user.id));
   const bookings = db.data.bookings.filter(b => b.studentId === req.user.id).map(b => ({ ...b, slot: db.data.slots.find(s => s.id === b.slotId), course: db.data.courses.find(c => c.id === b.courseId) }));
-  res.json({ courses, bookings, slots: db.data.slots.filter(s => !s.bookedBy).sort((a,b) => a.start.localeCompare(b.start)) });
+  // Показываем ученику все слоты: занятые остаются в календаре и отображаются как «Занято».
+  res.json({ courses, bookings, slots: db.data.slots.sort((a,b) => a.start.localeCompare(b.start)) });
 });
 app.get('/api/tutor', auth, tutor, async (req, res) => {
-  await db.read(); res.json({ students: db.data.users.filter(u => u.role === 'student').map(cleanUser), courses: db.data.courses, assignments: db.data.assignments, slots: db.data.slots.sort((a,b) => a.start.localeCompare(b.start)), bookings: db.data.bookings });
+  await db.read(); const slots = db.data.slots.map(s => { const booking = db.data.bookings.find(b => b.slotId === s.id); const student = booking && db.data.users.find(u => u.id === booking.studentId); const course = booking && db.data.courses.find(c => c.id === booking.courseId); return { ...s, bookedStudent: student?.name || null, bookedCourse: course?.title || null }; }); res.json({ students: db.data.users.filter(u => u.role === 'student').map(cleanUser), courses: db.data.courses, assignments: db.data.assignments, slots: slots.sort((a,b) => a.start.localeCompare(b.start)), bookings: db.data.bookings });
 });
 app.post('/api/courses', auth, tutor, async (req, res) => { await db.read(); const c = { id:id(), title:req.body.title?.trim(), description:req.body.description?.trim() || '' }; if (!c.title) return res.status(400).json({error:'Укажите название курса'}); db.data.courses.push(c); save(res,c); });
 app.post('/api/assignments', auth, tutor, async (req, res) => { await db.read(); const {courseId, studentId} = req.body; if (!db.data.assignments.some(a=>a.courseId===courseId&&a.studentId===studentId)) db.data.assignments.push({id:id(), courseId, studentId}); save(res,{ok:true}); });
+app.delete('/api/assignments/:courseId/:studentId', auth, tutor, async (req, res) => { await db.read(); db.data.assignments = db.data.assignments.filter(a => !(a.courseId === req.params.courseId && a.studentId === req.params.studentId)); save(res, {ok:true}); });
+app.delete('/api/courses/:id', auth, tutor, async (req, res) => { await db.read(); if (!db.data.courses.some(c => c.id === req.params.id)) return res.status(404).json({error:'Курс не найден'}); const courseBookings = db.data.bookings.filter(b => b.courseId === req.params.id); courseBookings.forEach(b => { const slot = db.data.slots.find(s => s.id === b.slotId); if (slot) slot.bookedBy = null; }); db.data.bookings = db.data.bookings.filter(b => b.courseId !== req.params.id); db.data.courses = db.data.courses.filter(c => c.id !== req.params.id); db.data.assignments = db.data.assignments.filter(a => a.courseId !== req.params.id); save(res, {ok:true}); });
 app.post('/api/slots', auth, tutor, async (req, res) => {
   await db.read(); const start = new Date(req.body.start); if (!validDateTime(req.body.start) || start.getMinutes() % 30) return res.status(400).json({error:'Время должно быть с шагом 30 минут'});
   const finish = new Date(start.getTime()+60*60*1000).toISOString();
