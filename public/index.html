@@ -1,1 +1,31 @@
-<!doctype html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Кабинет репетитора</title><link rel="stylesheet" href="/style.css"></head><body><main id="app"><section class="card auth"><h1>Кабинет репетитора</h1><p class="muted">Запись на занятия в удобное время</p><div class="tabs"><button onclick="showAuth('login')">Войти</button><button onclick="showAuth('register')">Регистрация</button></div><form id="authForm"><input name="name" placeholder="Имя" class="registerOnly"><input name="email" type="email" placeholder="Email" required><input name="password" type="password" placeholder="Пароль (минимум 6 символов)" required><input name="tutorCode" placeholder="Код репетитора (если нужен)" class="registerOnly"><button class="primary">Продолжить</button><p id="authError" class="error"></p></form></section></main><script src="/app.js"></script><script src="/calendar-labels.js"></script><script src="/course-manager.js"></script><script src="/course-actions.js"></script></body></html>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Кабинет репетитора</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- Toast container -->
+  <div id="toasts" aria-live="polite"></div>
+
+  <!-- Modal overlay -->
+  <div id="modalOverlay" class="modal-overlay" hidden>
+    <div class="modal-card">
+      <div class="modal-icon" id="modalIcon"></div>
+      <h3 id="modalTitle"></h3>
+      <p id="modalMessage"></p>
+      <div class="modal-actions" id="modalActions"></div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
