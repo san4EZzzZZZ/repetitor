@@ -9,6 +9,8 @@ let authMode = 'login';   // 'login' | 'register'
 let tutorTab = 'schedule'; // 'schedule' | 'courses' | 'students'
 let calWeek = new Date();
 let selectedDay = null;
+const BOOKING_LOCK_HOURS = 12;
+const BOOKING_LOCK_MS = BOOKING_LOCK_HOURS * 60 * 60 * 1000;
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => [...document.querySelectorAll(sel)];
@@ -21,6 +23,13 @@ const esc = (s) =>
 
 const dt = (s) =>
   new Date(s).toLocaleString('ru-RU', { dateStyle: 'medium', timeStyle: 'short' });
+
+const timeOnly = (s) =>
+  new Date(s).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+
+const slotRangeText = (slot) => `${timeOnly(slot.start)}-${timeOnly(slot.end)}`;
+
+const isSlotLocked = (slot) => new Date(slot.start).getTime() - Date.now() < BOOKING_LOCK_MS;
 
 const dayKey = (s) => {
   const d = new Date(s);
@@ -265,26 +274,32 @@ function renderCalendar(slots, role, bookings = []) {
 
         if (s) {
           const isMine = myBookingSlots.has(s.id);
+          const duration = Math.max(30, Math.round((new Date(s.end) - new Date(s.start)) / 60000) || 60);
+          const slotStyle = `style="--slot-rows:${duration / 30}"`;
+          const range = `<span class="slot-time">${slotRangeText(s)}</span>`;
+          const locked = isSlotLocked(s);
 
           if (role === 'tutor') {
             // Tutor: click to toggle slot
             action = `onclick="toggleSlot('${iso}','${s.id}','${s.bookedBy || ''}')"`;
             if (s.bookedBy) {
-              slotHTML = `<span class="cal-slot booked">${esc(s.bookedStudent || 'Занято')}${
+              slotHTML = `<span class="cal-slot booked" ${slotStyle}>${range}${esc(s.bookedStudent || 'Занято')}${
                 s.bookedCourse ? `<span class="text-small">${esc(s.bookedCourse)}</span>` : ''
               }</span>`;
             } else {
-              slotHTML = `<span class="cal-slot free">Свободно</span>`;
+              slotHTML = `<span class="cal-slot free" ${slotStyle}>${range}Свободно</span>`;
             }
           } else {
             // Student
             if (isMine) {
-              slotHTML = `<span class="cal-slot my-booking">Моё</span>`;
+              slotHTML = `<span class="cal-slot my-booking" ${slotStyle}>${range}Моё</span>`;
             } else if (s.bookedBy) {
-              slotHTML = `<span class="cal-slot booked">Занято</span>`;
+              slotHTML = `<span class="cal-slot booked" ${slotStyle}>${range}Занято</span>`;
+            } else if (locked) {
+              slotHTML = `<span class="cal-slot locked" ${slotStyle}>${range}Менее ${BOOKING_LOCK_HOURS} ч</span>`;
             } else {
               action = `onclick="bookFromCalendar('${s.id}')"`;
-              slotHTML = `<span class="cal-slot free">Записаться</span>`;
+              slotHTML = `<span class="cal-slot free" ${slotStyle}>${range}Записаться</span>`;
             }
           }
         } else if (role === 'tutor') {
@@ -408,7 +423,7 @@ async function renderTutor() {
             <hr>
 
             <h3>📦 Создать слоты пакетом</h3>
-            <p class="text-muted text-small" style="margin:6px 0 12px">Выберите диапазон дат и время — слоты создадутся автоматически.</p>
+            <p class="text-muted text-small" style="margin:6px 0 12px">Например: занятие 60 минут, шаг 30 минут создаст 08:00-09:00, 08:30-09:30 и дальше.</p>
             <form id="bulkForm" class="bulk-form">
               <div class="form-group">
                 <label class="form-label">Дата с</label>
@@ -426,6 +441,34 @@ async function renderTutor() {
                 <label class="form-label">Время по</label>
                 <input type="time" name="timeTo" step="1800" required>
               </div>
+              <div class="form-group">
+                <label class="form-label">Длительность</label>
+                <select name="durationMinutes">
+                  <option value="60">60 минут</option>
+                  <option value="45">45 минут</option>
+                  <option value="90">90 минут</option>
+                  <option value="30">30 минут</option>
+                  <option value="120">120 минут</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label">Шаг старта</label>
+                <select name="stepMinutes">
+                  <option value="30">Каждые 30 минут</option>
+                  <option value="15">Каждые 15 минут</option>
+                  <option value="45">Каждые 45 минут</option>
+                  <option value="60">Каждый час</option>
+                </select>
+              </div>
+              <div class="form-group full-width">
+                <label class="form-label">Дни недели</label>
+                <div class="weekday-picker">
+                  ${['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+                    .map((day, i) => `<label><input type="checkbox" name="weekday" value="${i + 1}" checked><span>${day}</span></label>`)
+                    .join('')}
+                </div>
+              </div>
+              <div class="bulk-preview full-width" id="bulkPreview">Заполните диапазон, и здесь появится предпросмотр.</div>
               <button type="submit" class="btn-primary full-width">Создать пакет слотов</button>
             </form>
           </div>
@@ -439,13 +482,14 @@ async function renderTutor() {
                       const s = data.slots.find((x) => x.id === b.slotId);
                       const st = data.students.find((x) => x.id === b.studentId);
                       const c = data.courses.find((x) => x.id === b.courseId);
+                      const locked = s && isSlotLocked(s);
                       return `
                       <div class="item">
                         <div class="item-info">
                           <div class="item-title">${esc(st?.name || '—')}</div>
                           <div class="item-sub">${dt(s?.start)} · ${esc(c?.title || '—')}</div>
                         </div>
-                        <button class="btn-danger" onclick="cancelBookingTutor('${b.id}')">Отменить</button>
+                        <button class="btn-danger" ${locked ? 'disabled title="До занятия меньше 12 часов"' : `onclick="cancelBookingTutor('${b.id}')"`}>Отменить</button>
                       </div>`;
                     })
                     .join('')
@@ -648,10 +692,19 @@ function bindTutorForms() {
   });
 
   // Bulk slot form
+  const bulkForm = $('#bulkForm');
+  bulkForm?.addEventListener('input', updateBulkPreview);
+  updateBulkPreview();
+
   $('#bulkForm')?.addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const btn = e.target.querySelector('.btn-primary');
+    const weekdays = fd.getAll('weekday').map(Number);
+    if (!weekdays.length) {
+      toast('Выберите хотя бы один день недели', 'error');
+      return;
+    }
     btn.innerHTML = '<span class="spinner"></span> Создаём...';
     btn.disabled = true;
     try {
@@ -662,6 +715,9 @@ function bindTutorForms() {
           dateTo: fd.get('dateTo'),
           timeFrom: fd.get('timeFrom'),
           timeTo: fd.get('timeTo'),
+          durationMinutes: Number(fd.get('durationMinutes')),
+          stepMinutes: Number(fd.get('stepMinutes')),
+          weekdays,
         }),
       });
       toast(`Создано ${result.created} слотов${result.skipped ? `, пропущено ${result.skipped}` : ''}`, 'success');
@@ -737,6 +793,52 @@ function bindTutorForms() {
       }
     }
   });
+}
+
+function updateBulkPreview() {
+  const form = $('#bulkForm');
+  const preview = $('#bulkPreview');
+  if (!form || !preview) return;
+
+  const fd = new FormData(form);
+  const timeFrom = fd.get('timeFrom');
+  const timeTo = fd.get('timeTo');
+  const duration = Number(fd.get('durationMinutes') || 60);
+  const step = Number(fd.get('stepMinutes') || 30);
+  const weekdays = fd.getAll('weekday');
+
+  if (!timeFrom || !timeTo) {
+    preview.textContent = 'Заполните диапазон, и здесь появится предпросмотр.';
+    return;
+  }
+
+  const [fromH, fromM] = timeFrom.split(':').map(Number);
+  const [toH, toM] = timeTo.split(':').map(Number);
+  const startMins = fromH * 60 + fromM;
+  const endMins = toH * 60 + toM;
+
+  if (!weekdays.length) {
+    preview.textContent = 'Выберите дни недели для генерации.';
+    return;
+  }
+  if (startMins + duration > endMins) {
+    preview.textContent = 'В этот промежуток не помещается слот с такой длительностью.';
+    return;
+  }
+
+  const ranges = [];
+  for (let mins = startMins; mins + duration <= endMins && ranges.length < 5; mins += step) {
+    const a = `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
+    const bMins = mins + duration;
+    const b = `${String(Math.floor(bMins / 60)).padStart(2, '0')}:${String(bMins % 60).padStart(2, '0')}`;
+    ranges.push(`${a}-${b}`);
+  }
+
+  preview.innerHTML = `
+    <span>Предпросмотр:</span>
+    ${ranges.map((range) => `<b>${range}</b>`).join('')}
+    <span>${ranges.length === 5 ? '...' : ''}</span>
+  `;
 }
 
 // ─── Tutor actions ──────────────────────────────
@@ -835,6 +937,7 @@ async function renderStudent() {
         <div class="legend">
           <span><span class="legend-dot free"></span>Свободный слот</span>
           <span><span class="legend-dot mine"></span>Моё занятие</span>
+          <span><span class="legend-dot locked"></span>Запись закрыта</span>
           <span><span class="legend-dot booked"></span>Занято</span>
         </div>
         ${renderCalendar(data.slots, 'student', data.bookings)}
@@ -853,7 +956,7 @@ async function renderStudent() {
                         <div class="item-title">${dt(b.slot.start)}</div>
                         <div class="item-sub">${esc(b.course?.title || '—')}</div>
                       </div>
-                      <button class="btn-danger" onclick="cancelBooking('${b.id}')">Отменить</button>
+                      <button class="btn-danger" ${isSlotLocked(b.slot) ? 'disabled title="До занятия меньше 12 часов"' : `onclick="cancelBooking('${b.id}')"`}>Отменить</button>
                     </div>`
                   )
                   .join('')

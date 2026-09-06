@@ -9,6 +9,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const TUTOR_INVITE_CODE = process.env.TUTOR_INVITE_CODE || 'teacher-demo-code';
+const BOOKING_LOCK_HOURS = 12;
+const BOOKING_LOCK_MS = BOOKING_LOCK_HOURS * 60 * 60 * 1000;
 
 const db = new Low(new JSONFile(path.join(__dirname, 'data', 'db.json')), {
   users: [],
@@ -60,6 +62,29 @@ function save(res, data) {
 function validDateTime(value) {
   const d = new Date(value);
   return !Number.isNaN(d.getTime());
+}
+
+function minutesFromTime(value) {
+  if (!/^\d{2}:\d{2}$/.test(String(value || ''))) return null;
+  const [hours, minutes] = value.split(':').map(Number);
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function slotRange(slot) {
+  const start = new Date(slot.start).getTime();
+  const end = slot.end
+    ? new Date(slot.end).getTime()
+    : start + 60 * 60 * 1000;
+  return { start, end };
+}
+
+function rangesOverlap(a, b) {
+  return a.start < b.end && b.start < a.end;
+}
+
+function isBookingLocked(slot) {
+  return new Date(slot.start).getTime() - Date.now() < BOOKING_LOCK_MS;
 }
 
 app.use(express.json());
@@ -261,6 +286,11 @@ app.post('/api/slots', auth, tutor, async (req, res) => {
 app.post('/api/slots/bulk', auth, tutor, async (req, res) => {
   await db.read();
   const { dateFrom, dateTo, timeFrom, timeTo } = req.body;
+  const durationMinutes = Number(req.body.durationMinutes || 60);
+  const stepMinutes = Number(req.body.stepMinutes || 60);
+  const weekdays = Array.isArray(req.body.weekdays)
+    ? req.body.weekdays.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 7)
+    : [1, 2, 3, 4, 5, 6, 7];
 
   if (!dateFrom || !dateTo || !timeFrom || !timeTo) {
     return res.status(400).json({ error: 'Укажите диапазон дат и времени' });
@@ -272,24 +302,37 @@ app.post('/api/slots/bulk', auth, tutor, async (req, res) => {
     return res.status(400).json({ error: 'Некорректный диапазон дат' });
   }
 
-  const [hFrom, mFrom] = timeFrom.split(':').map(Number);
-  const [hTo, mTo] = timeTo.split(':').map(Number);
-  const startMins = hFrom * 60 + mFrom;
-  const endMins = hTo * 60 + mTo;
+  const startMins = minutesFromTime(timeFrom);
+  const endMins = minutesFromTime(timeTo);
 
-  if (startMins >= endMins) {
+  if (startMins === null || endMins === null || startMins >= endMins) {
     return res.status(400).json({ error: 'Время начала должно быть раньше времени окончания' });
+  }
+  if (![30, 45, 60, 90, 120].includes(durationMinutes)) {
+    return res.status(400).json({ error: 'Выберите корректную длительность занятия' });
+  }
+  if (![15, 30, 45, 60].includes(stepMinutes)) {
+    return res.status(400).json({ error: 'Выберите корректный шаг начала слотов' });
+  }
+  if (!weekdays.length) {
+    return res.status(400).json({ error: 'Выберите хотя бы один день недели' });
+  }
+  if (startMins + durationMinutes > endMins) {
+    return res.status(400).json({ error: 'В выбранный интервал не помещается ни один слот' });
   }
 
   const created = [];
   const skipped = [];
 
   for (let d = new Date(dFrom); d <= dTo; d.setDate(d.getDate() + 1)) {
-    for (let mins = startMins; mins < endMins; mins += 60) {
+    const weekday = d.getDay() === 0 ? 7 : d.getDay();
+    if (!weekdays.includes(weekday)) continue;
+
+    for (let mins = startMins; mins + durationMinutes <= endMins; mins += stepMinutes) {
       const start = new Date(d);
       start.setHours(Math.floor(mins / 60), mins % 60, 0, 0);
       const iso = start.toISOString();
-      const finish = new Date(start.getTime() + 60 * 60 * 1000).toISOString();
+      const finish = new Date(start.getTime() + durationMinutes * 60 * 1000).toISOString();
 
       if (db.data.slots.some((s) => s.start === iso)) {
         skipped.push(iso);
@@ -333,12 +376,17 @@ app.post('/api/bookings', auth, async (req, res) => {
   if (!allowed) {
     return res.status(403).json({ error: 'Курс не назначен вам' });
   }
+  if (isBookingLocked(slot)) {
+    return res.status(409).json({
+      error: `Записаться можно не позднее чем за ${BOOKING_LOCK_HOURS} часов до занятия`,
+    });
+  }
 
-  const start = new Date(slot.start).getTime();
+  const targetRange = slotRange(slot);
   const hasConflict = db.data.bookings.some((b) => {
     if (b.studentId !== req.user.id) return false;
     const otherSlot = db.data.slots.find((s) => s.id === b.slotId);
-    return otherSlot && Math.abs(new Date(otherSlot.start).getTime() - start) < 60 * 60 * 1000;
+    return otherSlot && rangesOverlap(targetRange, slotRange(otherSlot));
   });
 
   if (hasConflict) {
@@ -357,6 +405,14 @@ app.delete('/api/bookings/:id', auth, async (req, res) => {
     return res.status(404).json({ error: 'Запись не найдена' });
   }
   const s = db.data.slots.find((x) => x.id === b.slotId);
+  if (!s) {
+    return res.status(404).json({ error: 'Слот не найден' });
+  }
+  if (isBookingLocked(s)) {
+    return res.status(409).json({
+      error: `Отменить запись можно не позднее чем за ${BOOKING_LOCK_HOURS} часов до занятия`,
+    });
+  }
   if (s) s.bookedBy = null;
   db.data.bookings = db.data.bookings.filter((x) => x.id !== b.id);
   save(res, { ok: true });
