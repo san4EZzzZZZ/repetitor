@@ -2,8 +2,6 @@ const express = require('express');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { Low } = require('lowdb');
-const { JSONFile } = require('lowdb/node');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,15 +10,20 @@ const TUTOR_INVITE_CODE = process.env.TUTOR_INVITE_CODE || 'teacher-demo-code';
 const BOOKING_LOCK_HOURS = 12;
 const BOOKING_LOCK_MS = BOOKING_LOCK_HOURS * 60 * 60 * 1000;
 
-const db = new Low(new JSONFile(path.join(__dirname, 'data', 'db.json')), {
-  users: [],
-  courses: [],
-  assignments: [],
-  slots: [],
-  bookings: [],
-});
+let db;
 
 async function init() {
+  const { Low } = await import('lowdb');
+  const { JSONFile } = await import('lowdb/node');
+
+  db = new Low(new JSONFile(path.join(__dirname, 'data', 'db.json')), {
+    users: [],
+    courses: [],
+    assignments: [],
+    slots: [],
+    bookings: [],
+  });
+
   await require('fs').promises.mkdir(path.join(__dirname, 'data'), { recursive: true });
   await db.read();
   db.data ||= { users: [], courses: [], assignments: [], slots: [], bookings: [] };
