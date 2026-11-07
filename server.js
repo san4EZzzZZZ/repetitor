@@ -26,7 +26,6 @@ async function init() {
 
   await require('fs').promises.mkdir(path.join(__dirname, 'data'), { recursive: true });
   await db.read();
-  db.data ||= { users: [], courses: [], assignments: [], slots: [], bookings: [] };
   await db.write();
 }
 
@@ -56,10 +55,62 @@ function tutor(req, res, next) {
   next();
 }
 
-function save(res, data) {
-  db.write()
-    .then(() => res.json(data))
-    .catch(() => res.status(500).json({ error: 'Ошибка сохранения' }));
+// Work on a separate snapshot so reads see only successfully saved data.
+let writeQueue = Promise.resolve();
+
+function writeRoute(handler) {
+  return (req, res) => {
+    const run = writeQueue.then(async () => {
+      const data = structuredClone(db.data);
+      const save = async (payload, status = 200) => {
+        await db.adapter.write(data);
+        db.data = data;
+        res.status(status).json(payload);
+      };
+      await handler(req, res, data, save);
+    });
+    writeQueue = run.catch((error) => {
+      console.error('Database write failed:', error.code || error.name);
+      if (!res.headersSent) res.status(500).json({ error: 'Ошибка сохранения' });
+    });
+  };
+}
+
+function readCredentials(body, res) {
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const { password } = body;
+  if (!name || name.length > 100) {
+    res.status(400).json({ error: 'Укажите имя до 100 символов' });
+  } else if (email.length > 254 || !/^[^\s@]+@[^\s@]+$/.test(email)) {
+    res.status(400).json({ error: 'Укажите действующий email' });
+  } else if (typeof password !== 'string' || password.length < 6 || Buffer.byteLength(password) > 72) {
+    res.status(400).json({ error: 'Пароль должен содержать от 6 символов и занимать до 72 байт' });
+  } else {
+    return { name, email, password };
+  }
+  return null;
+}
+
+function validateCourseIds(courseIds, data, res) {
+  if (!Array.isArray(courseIds) || courseIds.some((courseId) => typeof courseId !== 'string')) {
+    res.status(400).json({ error: 'Укажите список курсов' });
+    return null;
+  }
+  const ids = [...new Set(courseIds)];
+  const existing = new Set(data.courses.map((course) => course.id));
+  if (ids.some((courseId) => !existing.has(courseId))) {
+    res.status(404).json({ error: 'Курс не найден. Обновите страницу и выберите курсы снова' });
+    return null;
+  }
+  return ids;
+}
+
+function addAssignments(data, studentId, courseIds) {
+  const assigned = new Set(data.assignments.filter((a) => a.studentId === studentId).map((a) => a.courseId));
+  const added = courseIds.filter((courseId) => !assigned.has(courseId));
+  data.assignments.push(...added.map((courseId) => ({ id: id(), courseId, studentId })));
+  return added.length;
 }
 
 function validDateTime(value) {
@@ -86,7 +137,22 @@ function rangesOverlap(a, b) {
   return a.start < b.end && b.start < a.end;
 }
 
-function isBookingLocked(slot) {
+function getBookedRanges(slots) {
+  return slots
+    .filter((slot) => slot.bookedBy)
+    .map((slot) => ({ bookedBy: slot.bookedBy, range: slotRange(slot) }));
+}
+
+function findOverlappingBooking(slot, bookedRanges) {
+  const range = slotRange(slot);
+  return bookedRanges.find((booking) => rangesOverlap(range, booking.range));
+}
+
+function hasSlotStarted(slot, now = Date.now()) {
+  return new Date(slot.start).getTime() <= now;
+}
+
+function isCancellationLocked(slot) {
   return new Date(slot.start).getTime() - Date.now() < BOOKING_LOCK_MS;
 }
 
@@ -95,36 +161,27 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ─── Auth ──────────────────────────────────────────────
 
-app.post('/api/auth/register', async (req, res) => {
-  const { name, email, password, tutorCode } = req.body;
-  if (!name || !email || !password || password.length < 6) {
-    return res.status(400).json({ error: 'Заполните имя, email и пароль от 6 символов' });
-  }
-  await db.read();
-  if (db.data.users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
+app.post('/api/auth/register', writeRoute(async (req, res, data, save) => {
+  const credentials = readCredentials(req.body, res);
+  if (!credentials) return;
+  const { name, email, password } = credentials;
+  if (data.users.some((u) => u.email.toLowerCase() === email)) {
     return res.status(409).json({ error: 'Этот email уже зарегистрирован' });
   }
-  const role = tutorCode === TUTOR_INVITE_CODE ? 'tutor' : 'student';
-  const user = {
-    id: id(),
-    name,
-    email: email.toLowerCase(),
-    password: await bcrypt.hash(password, 10),
-    role,
-  };
-  db.data.users.push(user);
+  const role = req.body.tutorCode === TUTOR_INVITE_CODE ? 'tutor' : 'student';
+  const user = { id: id(), name, email, password: await bcrypt.hash(password, 10), role };
+  data.users.push(user);
   const token = jwt.sign({ id: user.id, role: user.role, name: user.name }, JWT_SECRET, {
     expiresIn: '30d',
   });
-  save(res, { token, user: cleanUser(user) });
-});
+  return save({ token, user: cleanUser(user) });
+}));
 
 app.post('/api/auth/login', async (req, res) => {
-  await db.read();
-  const user = db.data.users.find(
-    (u) => u.email === String(req.body.email || '').toLowerCase()
-  );
-  if (!user || !(await bcrypt.compare(req.body.password || '', user.password))) {
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const user = db.data.users.find((u) => u.email.toLowerCase() === email);
+  const { password } = req.body;
+  if (!user || typeof password !== 'string' || !(await bcrypt.compare(password, user.password))) {
     return res.status(401).json({ error: 'Неверный email или пароль' });
   }
   res.json({
@@ -136,14 +193,14 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/me', auth, async (req, res) => {
-  await db.read();
-  res.json({ user: cleanUser(db.data.users.find((u) => u.id === req.user.id)) });
+  const user = db.data.users.find((u) => u.id === req.user.id);
+  if (!user) return res.status(401).json({ error: 'Требуется авторизация' });
+  res.json({ user: cleanUser(user) });
 });
 
 // ─── Student data ──────────────────────────────────────
 
 app.get('/api/student', auth, async (req, res) => {
-  await db.read();
   const courses = db.data.courses.filter((c) =>
     db.data.assignments.some((a) => a.courseId === c.id && a.studentId === req.user.id)
   );
@@ -154,23 +211,25 @@ app.get('/api/student', auth, async (req, res) => {
       slot: db.data.slots.find((s) => s.id === b.slotId),
       course: db.data.courses.find((c) => c.id === b.courseId),
     }));
-  res.json({
-    courses,
-    bookings,
-    slots: db.data.slots.sort((a, b) => a.start.localeCompare(b.start)),
-  });
+  const bookedRanges = getBookedRanges(db.data.slots);
+  const now = Date.now();
+  const slots = db.data.slots
+    .filter((slot) => slot.bookedBy || (!hasSlotStarted(slot, now) && !findOverlappingBooking(slot, bookedRanges)))
+    .sort((a, b) => a.start.localeCompare(b.start));
+  res.json({ courses, bookings, slots });
 });
 
 // ─── Tutor data ────────────────────────────────────────
 
 app.get('/api/tutor', auth, tutor, async (req, res) => {
-  await db.read();
+  const bookedRanges = getBookedRanges(db.data.slots);
   const slots = db.data.slots.map((s) => {
     const booking = db.data.bookings.find((b) => b.slotId === s.id);
     const student = booking && db.data.users.find((u) => u.id === booking.studentId);
     const course = booking && db.data.courses.find((c) => c.id === booking.courseId);
     return {
       ...s,
+      blockedByBooking: !s.bookedBy && Boolean(findOverlappingBooking(s, bookedRanges)),
       bookedStudent: student?.name || null,
       bookedCourse: course?.title || null,
     };
@@ -187,7 +246,6 @@ app.get('/api/tutor', auth, tutor, async (req, res) => {
 // ─── Tutor stats ───────────────────────────────────────
 
 app.get('/api/tutor/stats', auth, tutor, async (req, res) => {
-  await db.read();
   const totalSlots = db.data.slots.length;
   const bookedSlots = db.data.slots.filter((s) => s.bookedBy).length;
   const totalStudents = db.data.users.filter((u) => u.role === 'student').length;
@@ -196,7 +254,7 @@ app.get('/api/tutor/stats', auth, tutor, async (req, res) => {
 
   const now = new Date();
   const weekStart = new Date(now);
-  weekStart.setDate(now.getDate() - now.getDay() + 1);
+  weekStart.setDate(now.getDate() - ((now.getDay() + 6) % 7));
   weekStart.setHours(0, 0, 0, 0);
   const weekEnd = new Date(weekStart);
   weekEnd.setDate(weekStart.getDate() + 7);
@@ -220,74 +278,96 @@ app.get('/api/tutor/stats', auth, tutor, async (req, res) => {
   });
 });
 
+app.post('/api/tutor/students', auth, tutor, writeRoute(async (req, res, data, save) => {
+  const credentials = readCredentials(req.body, res);
+  if (!credentials) return;
+  const { name, email, password } = credentials;
+  if (data.users.some((u) => u.email.toLowerCase() === email)) {
+    return res.status(409).json({ error: 'Этот email уже зарегистрирован. Найдите ученика в списке по email' });
+  }
+  const courseIds = validateCourseIds(req.body.courseIds ?? [], data, res);
+  if (!courseIds) return;
+  const student = { id: id(), name, email, password: await bcrypt.hash(password, 10), role: 'student' };
+  data.users.push(student);
+  addAssignments(data, student.id, courseIds);
+  return save({ student: cleanUser(student), courseIds }, 201);
+}));
+
+app.post('/api/tutor/students/:studentId/courses', auth, tutor, writeRoute(async (req, res, data, save) => {
+  const { studentId } = req.params;
+  if (!data.users.some((user) => user.id === studentId && user.role === 'student')) {
+    return res.status(404).json({ error: 'Ученик не найден' });
+  }
+  const courseIds = validateCourseIds(req.body.courseIds, data, res);
+  if (!courseIds) return;
+  if (!courseIds.length) return res.status(400).json({ error: 'Выберите хотя бы один курс' });
+  return save({ added: addAssignments(data, studentId, courseIds) });
+}));
+
 // ─── Courses ───────────────────────────────────────────
 
-app.post('/api/courses', auth, tutor, async (req, res) => {
-  await db.read();
+app.post('/api/courses', auth, tutor, writeRoute(async (req, res, data, save) => {
   const c = {
     id: id(),
     title: req.body.title?.trim(),
     description: req.body.description?.trim() || '',
   };
   if (!c.title) return res.status(400).json({ error: 'Укажите название курса' });
-  db.data.courses.push(c);
-  save(res, c);
-});
+  data.courses.push(c);
+  return save(c);
+}));
 
-app.delete('/api/courses/:id', auth, tutor, async (req, res) => {
-  await db.read();
-  if (!db.data.courses.some((c) => c.id === req.params.id)) {
+app.delete('/api/courses/:id', auth, tutor, writeRoute(async (req, res, data, save) => {
+  if (!data.courses.some((c) => c.id === req.params.id)) {
     return res.status(404).json({ error: 'Курс не найден' });
   }
-  const courseBookings = db.data.bookings.filter((b) => b.courseId === req.params.id);
+  const courseBookings = data.bookings.filter((b) => b.courseId === req.params.id);
   courseBookings.forEach((b) => {
-    const slot = db.data.slots.find((s) => s.id === b.slotId);
+    const slot = data.slots.find((s) => s.id === b.slotId);
     if (slot) slot.bookedBy = null;
   });
-  db.data.bookings = db.data.bookings.filter((b) => b.courseId !== req.params.id);
-  db.data.courses = db.data.courses.filter((c) => c.id !== req.params.id);
-  db.data.assignments = db.data.assignments.filter((a) => a.courseId !== req.params.id);
-  save(res, { ok: true });
-});
+  data.bookings = data.bookings.filter((b) => b.courseId !== req.params.id);
+  data.courses = data.courses.filter((c) => c.id !== req.params.id);
+  data.assignments = data.assignments.filter((a) => a.courseId !== req.params.id);
+  return save({ ok: true });
+}));
 
 // ─── Assignments ───────────────────────────────────────
 
-app.post('/api/assignments', auth, tutor, async (req, res) => {
-  await db.read();
+app.post('/api/assignments', auth, tutor, writeRoute(async (req, res, data, save) => {
   const { courseId, studentId } = req.body;
-  if (!db.data.assignments.some((a) => a.courseId === courseId && a.studentId === studentId)) {
-    db.data.assignments.push({ id: id(), courseId, studentId });
+  if (!data.users.some((user) => user.id === studentId && user.role === 'student')) {
+    return res.status(404).json({ error: 'Ученик не найден' });
   }
-  save(res, { ok: true });
-});
+  const courseIds = validateCourseIds([courseId], data, res);
+  if (!courseIds) return;
+  return save({ ok: true, added: addAssignments(data, studentId, courseIds) });
+}));
 
-app.delete('/api/assignments/:courseId/:studentId', auth, tutor, async (req, res) => {
-  await db.read();
-  db.data.assignments = db.data.assignments.filter(
+app.delete('/api/assignments/:courseId/:studentId', auth, tutor, writeRoute(async (req, res, data, save) => {
+  data.assignments = data.assignments.filter(
     (a) => !(a.courseId === req.params.courseId && a.studentId === req.params.studentId)
   );
-  save(res, { ok: true });
-});
+  return save({ ok: true });
+}));
 
 // ─── Slots ─────────────────────────────────────────────
 
-app.post('/api/slots', auth, tutor, async (req, res) => {
-  await db.read();
+app.post('/api/slots', auth, tutor, writeRoute(async (req, res, data, save) => {
   const start = new Date(req.body.start);
   if (!validDateTime(req.body.start) || start.getMinutes() % 30) {
     return res.status(400).json({ error: 'Время должно быть с шагом 30 минут' });
   }
   const finish = new Date(start.getTime() + 60 * 60 * 1000).toISOString();
-  if (db.data.slots.some((s) => s.start === start.toISOString())) {
+  if (data.slots.some((s) => s.start === start.toISOString())) {
     return res.status(409).json({ error: 'Такой слот уже существует' });
   }
   const slot = { id: id(), start: start.toISOString(), end: finish, bookedBy: null };
-  db.data.slots.push(slot);
-  save(res, slot);
-});
+  data.slots.push(slot);
+  return save(slot);
+}));
 
-app.post('/api/slots/bulk', auth, tutor, async (req, res) => {
-  await db.read();
+app.post('/api/slots/bulk', auth, tutor, writeRoute(async (req, res, data, save) => {
   const { dateFrom, dateTo, timeFrom, timeTo } = req.body;
   const durationMinutes = Number(req.body.durationMinutes || 60);
   const stepMinutes = Number(req.body.stepMinutes || 60);
@@ -337,39 +417,35 @@ app.post('/api/slots/bulk', auth, tutor, async (req, res) => {
       const iso = start.toISOString();
       const finish = new Date(start.getTime() + durationMinutes * 60 * 1000).toISOString();
 
-      if (db.data.slots.some((s) => s.start === iso)) {
+      if (data.slots.some((s) => s.start === iso)) {
         skipped.push(iso);
         continue;
       }
 
       const slot = { id: id(), start: iso, end: finish, bookedBy: null };
-      db.data.slots.push(slot);
+      data.slots.push(slot);
       created.push(slot);
     }
   }
 
-  db.write()
-    .then(() => res.json({ created: created.length, skipped: skipped.length }))
-    .catch(() => res.status(500).json({ error: 'Ошибка сохранения' }));
-});
+  return save({ created: created.length, skipped: skipped.length });
+}));
 
-app.delete('/api/slots/:id', auth, tutor, async (req, res) => {
-  await db.read();
-  const s = db.data.slots.find((x) => x.id === req.params.id);
+app.delete('/api/slots/:id', auth, tutor, writeRoute(async (req, res, data, save) => {
+  const s = data.slots.find((x) => x.id === req.params.id);
   if (!s || s.bookedBy) {
     return res.status(400).json({ error: 'Нельзя удалить занятый слот' });
   }
-  db.data.slots = db.data.slots.filter((x) => x.id !== req.params.id);
-  save(res, { ok: true });
-});
+  data.slots = data.slots.filter((x) => x.id !== req.params.id);
+  return save({ ok: true });
+}));
 
 // ─── Bookings ──────────────────────────────────────────
 
-app.post('/api/bookings', auth, async (req, res) => {
-  await db.read();
+app.post('/api/bookings', auth, writeRoute(async (req, res, data, save) => {
   const { slotId, courseId } = req.body;
-  const slot = db.data.slots.find((s) => s.id === slotId);
-  const allowed = db.data.assignments.some(
+  const slot = data.slots.find((s) => s.id === slotId);
+  const allowed = data.assignments.some(
     (a) => a.courseId === courseId && a.studentId === req.user.id
   );
 
@@ -379,47 +455,41 @@ app.post('/api/bookings', auth, async (req, res) => {
   if (!allowed) {
     return res.status(403).json({ error: 'Курс не назначен вам' });
   }
-  if (isBookingLocked(slot)) {
-    return res.status(409).json({
-      error: `Записаться можно не позднее чем за ${BOOKING_LOCK_HOURS} часов до занятия`,
-    });
+  if (hasSlotStarted(slot)) {
+    return res.status(409).json({ error: 'Занятие уже началось' });
   }
 
-  const targetRange = slotRange(slot);
-  const hasConflict = db.data.bookings.some((b) => {
-    if (b.studentId !== req.user.id) return false;
-    const otherSlot = db.data.slots.find((s) => s.id === b.slotId);
-    return otherSlot && rangesOverlap(targetRange, slotRange(otherSlot));
-  });
-
-  if (hasConflict) {
-    return res.status(409).json({ error: 'У вас уже есть занятие в это время' });
+  const conflict = findOverlappingBooking(slot, getBookedRanges(data.slots));
+  if (conflict) {
+    const error = conflict.bookedBy === req.user.id
+      ? 'У вас уже есть занятие в это время'
+      : 'Это время уже занято. Выберите другой слот';
+    return res.status(409).json({ error });
   }
 
   slot.bookedBy = req.user.id;
-  db.data.bookings.push({ id: id(), slotId, courseId, studentId: req.user.id });
-  save(res, { ok: true });
-});
+  data.bookings.push({ id: id(), slotId, courseId, studentId: req.user.id });
+  return save({ ok: true });
+}));
 
-app.delete('/api/bookings/:id', auth, async (req, res) => {
-  await db.read();
-  const b = db.data.bookings.find((x) => x.id === req.params.id);
+app.delete('/api/bookings/:id', auth, writeRoute(async (req, res, data, save) => {
+  const b = data.bookings.find((x) => x.id === req.params.id);
   if (!b || (b.studentId !== req.user.id && req.user.role !== 'tutor')) {
     return res.status(404).json({ error: 'Запись не найдена' });
   }
-  const s = db.data.slots.find((x) => x.id === b.slotId);
+  const s = data.slots.find((x) => x.id === b.slotId);
   if (!s) {
     return res.status(404).json({ error: 'Слот не найден' });
   }
-  if (isBookingLocked(s)) {
+  if (isCancellationLocked(s)) {
     return res.status(409).json({
       error: `Отменить запись можно не позднее чем за ${BOOKING_LOCK_HOURS} часов до занятия`,
     });
   }
   if (s) s.bookedBy = null;
-  db.data.bookings = db.data.bookings.filter((x) => x.id !== b.id);
-  save(res, { ok: true });
-});
+  data.bookings = data.bookings.filter((x) => x.id !== b.id);
+  return save({ ok: true });
+}));
 
 // ─── SPA fallback ──────────────────────────────────────
 
